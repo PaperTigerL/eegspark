@@ -1,0 +1,54 @@
+services:
+  # 数据发送端
+  data-sender:
+    image: eeg-data-sender:v4  # 更新版本
+    networks:
+      - data_network
+    volumes:
+      - ./src:/app/src  # 挂载src目录
+      - ../eegspark/data/ds005779:/app/data/ds005779  # 修正数据目录路径
+    working_dir: /app/src/sender  # 设置工作目录
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    container_name: data-sender
+
+  # Spark Worker节点
+  spark-worker:
+    image: eeg-spark-worker:v2  # 更新版本
+    environment:
+      - SPARK_MODE=worker
+      - SPARK_MASTER_URL=spark://spark-master:7077
+      - SPARK_WORKER_MEMORY=1G
+      - SPARK_WORKER_CORES=1
+    volumes:
+      - ./src:/app/src  # 同样挂载src目录
+      - ./data:/opt/eegproject/data
+      - ./results:/opt/eegproject/results
+    ports:
+      - "5000:5000"  # 添加Flask服务端口映射
+    working_dir: /app/src
+    networks:
+      - data_network
+    depends_on:
+      - spark-master
+      - data-sender
+
+  # Spark Master节点
+  spark-master:
+    image: bitnami/spark:custom  # 使用自定义版本
+    environment:
+      - SPARK_MODE=master
+      - SPARK_MASTER_PORT=7077
+      - SPARK_MASTER_WEBUI_PORT=8080
+    volumes:
+      - ./src:/app/src  # 添加src目录挂载
+    ports:
+      - "8080:8080"
+      - "7077:7077"
+    networks:
+      - data_network
+
+networks:
+  data_network:
+    driver: bridge
