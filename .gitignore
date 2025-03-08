@@ -1,0 +1,28 @@
+﻿# 鏁版嵁鐩綍
+/results/
+/data/
+/received_data/
+/processed_data/
+
+# Python缂撳瓨
+__pycache__/
+*.py[cod]
+*.class
+
+# 涓存椂鏂囦欢
+*.log
+*.tmp
+.history/
+temp_*/
+*.zip
+
+# 铏氭嫙鐜
+/venv/
+/env/
+
+# 鍏朵粬澶ф枃浠?
+*.npz
+*.npy
+*.csv
+*.parquet
+*.json

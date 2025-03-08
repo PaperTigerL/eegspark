@@ -1,0 +1,134 @@
+version: '3'
+
+services:
+  # 数据发送端1
+  data-sender-1:
+    image: eeg-data-sender:v7
+    networks:
+      data_network:
+        aliases:
+          - data-sender-1
+    volumes:
+      - ./src:/app/src
+      - ../eegspark/data/ds005779:/app/data/ds005779
+    environment:
+      - SUBJECT_ID=01
+      - PORT=9000
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    container_name: data-sender-1
+
+  data-sender-2:
+    image: eeg-data-sender:v7
+    networks:
+      data_network:
+        aliases:
+          - data-sender-2
+    volumes:
+      - ./src:/app/src
+      - ../eegspark/data/ds005779:/app/data/ds005779
+    environment:
+      - SUBJECT_ID=02
+      - PORT=9002
+    ports:
+      - "9002:9002"
+      - "9003:9003"
+    container_name: data-sender-2
+
+  spark-master:
+    image: bitnami/spark:custom
+    ports:
+      - "7077:7077"
+      - "8080:8080"
+    environment:
+      - SPARK_MODE=master
+    volumes:
+      - ./src:/app/src
+      - ./data:/opt/eegproject/data
+      - ./results:/opt/eegproject/results
+    networks:
+      data_network:
+        aliases:
+          - spark-master
+    container_name: spark-master
+
+  spark-worker:
+    image: eeg-spark-worker:v5
+    container_name: spark-worker
+    environment:
+      - SPARK_MODE=worker
+      - SPARK_MASTER_URL=spark://spark-master:7077
+      - SPARK_WORKER_MEMORY=8g     # 从2G增加到4G
+      - SPARK_WORKER_CORES=2
+      - SPARK_DAEMON_MEMORY=2g     # 添加daemon内存
+      - SPARK_EXECUTOR_MEMORY=8g   # 设置executor内存
+      - SPARK_DRIVER_MEMORY=6g
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - ./src:/app/src
+      - ./data:/opt/eegproject/data
+      - ./results:/opt/eegproject/results
+    ports:
+      - "5000:5000"
+      - "8081:8081"  # Spark Worker UI 端口
+      - "8082:8080"  # 将容器内的8080端口映射到主机的8082端口
+    working_dir: /app/src
+    networks:
+      data_network:
+        aliases:
+          - spark-worker
+    depends_on:
+      - spark-master
+      - data-sender-1
+      - data-sender-2
+
+  spark-worker-1:
+    # 配置与当前worker相同
+    image: eeg-spark-worker:v5
+    container_name: spark-worker-1
+    environment:
+      - SPARK_MODE=worker
+      - SPARK_MASTER_URL=spark://spark-master:7077
+      - SPARK_WORKER_MEMORY=8g
+      - SPARK_WORKER_CORES=2
+      - SPARK_DAEMON_MEMORY=2g
+      - SPARK_EXECUTOR_MEMORY=8g
+      - SPARK_DRIVER_MEMORY=6g
+    volumes:
+      - ./src:/app/src
+      - ./data:/opt/eegproject/data
+      - ./results:/opt/eegproject/results
+    networks:
+      data_network:
+        aliases:
+          - spark-worker-1
+    depends_on:
+      - spark-master
+
+  spark-worker-2:
+    # 额外的worker
+    image: eeg-spark-worker:v5
+    container_name: spark-worker-2
+    environment:
+      - SPARK_MODE=worker
+      - SPARK_MASTER_URL=spark://spark-master:7077
+      - SPARK_WORKER_MEMORY=8g
+      - SPARK_WORKER_CORES=2
+      - SPARK_DAEMON_MEMORY=2g
+      - SPARK_EXECUTOR_MEMORY=8g
+      - SPARK_DRIVER_MEMORY=6g
+    volumes:
+      - ./src:/app/src
+      - ./data:/opt/eegproject/data
+      - ./results:/opt/eegproject/results
+    networks:
+      data_network:
+        aliases:
+          - spark-worker-2
+    depends_on:
+      - spark-master
+
+networks:
+  data_network:
+    driver: bridge
