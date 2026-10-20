@@ -39,8 +39,16 @@ logger = logging.getLogger('SparkEEGReceiver')
 
 class SparkEEGReceiver:
     """Spark EEG数据接收器 - 专注于数据接收和转换"""
-    def __init__(self, spark, data_sources, save_dir='./received_data'):
-        """初始化EEG接收器"""
+    def __init__(self, spark, data_sources, save_dir='./received_data', buffer_duration=3.0, min_data_duration=2.0):
+        """初始化EEG接收器
+        
+        Args:
+            spark: SparkSession对象
+            data_sources: 数据源列表
+            save_dir: 数据保存目录
+            buffer_duration: 数据缓冲区持续时间(秒)
+            min_data_duration: 最小数据长度要求(秒)
+        """
         self.spark = spark
         self.data_sources = data_sources
         self.save_dir = save_dir
@@ -56,8 +64,20 @@ class SparkEEGReceiver:
         
         self.receiver_threads = []  # 添加这一行
         
+        # 数据缓冲设置
+        self.buffer_duration = buffer_duration  # 缓冲区持续时间(秒)
+        self.min_data_duration = min_data_duration  # 最小数据长度要求(秒)
+        self.data_buffers = {}  # 按受试者ID存储的数据缓冲区
+        self.metadata_buffers = {}  # 按受试者ID存储的元数据缓冲区
+        
         # 确保保存目录存在
         os.makedirs(save_dir, exist_ok=True)
+        
+        # 新增日志
+        try:
+            logger.info(f"[SparkEEGReceiver.__init__] 传入SparkSession: id={id(spark)}, appName={getattr(spark.sparkContext, 'appName', '未知')}")
+        except Exception as e:
+            logger.warning(f"[SparkEEGReceiver.__init__] 记录SparkSession日志失败: {e}")
     
     def set_data_callback(self, callback):
         """设置数据处理回调函数"""
@@ -231,31 +251,14 @@ class SparkEEGReceiver:
             return None
     
     def _process_received_data(self, subject_id, metadata, eeg_data):
-        """处理接收到的EEG数据 - 仅保存并通知回调，不进行处理"""
+        """处理接收到的EEG数据 - 优化版，实现更灵活的数据累积策略"""
         try:
-            # 创建EEGRDD对象
-            metadata['subject_id'] = subject_id
-            
-            # 添加调试输出
-            logger.info(f"开始创建EEGRDD对象，metadata keys: {list(metadata.keys())}")
-            if 'channel_locations' in metadata:
-                logger.info(f"处理前：元数据中channel_locations长度: {len(metadata['channel_locations'])}")
-                
-                # 检查数据维度和通道名称是否匹配
-                if eeg_data.shape[0] != len(metadata['channel_locations']):
-                    logger.warning(f"数据维度({eeg_data.shape[0]})与通道名称数量({len(metadata['channel_locations'])})不匹配")
-
-            # 创建EEGRDD对象
-            eeg_rdd = EEGRDD.from_metadata_and_data(metadata, eeg_data)
-
-            # 创建后检查
-            logger.info(f"创建EEGRDD后，channel_locations长度: {len(eeg_rdd.channel_locations) if hasattr(eeg_rdd, 'channel_locations') else 0}")
-            self.latest_eegrdd = eeg_rdd
-            
             # 更新统计信息
             self.received_count += 1
+            self.stats['packets_received'] += 1
+            self.stats['bytes_received'] += eeg_data.size * eeg_data.itemsize
             
-            # 保存数据
+            # 保存原始数据
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
             save_path = os.path.join(self.save_dir, f"{subject_id}_{timestamp}.npz")
             np.savez(save_path, 
@@ -265,42 +268,114 @@ class SparkEEGReceiver:
             
             logger.info(f"接收到的数据已保存: {save_path}")
             
-            # 触发回调，但确保不包含处理逻辑
-            if self.data_callback and callable(self.data_callback):
-                logger.info(f"触发数据回调: 受试者 {subject_id}")
-                try:
-                    self.data_callback(subject_id, eeg_rdd)
-                except Exception as e:
-                    logger.error(f"数据回调执行失败: {e}", exc_info=True)
+            # 数据缓冲处理 - 优化版
+            sampling_rate = metadata.get('sampling_rate', 250)  # 默认采样率250Hz
             
+            # 初始化缓冲区（如果不存在）
+            if subject_id not in self.data_buffers:
+                self.data_buffers[subject_id] = []
+                self.metadata_buffers[subject_id] = metadata.copy()
+                logger.info(f"为受试者 {subject_id} 创建新的数据缓冲区")
+            
+            # 添加数据到缓冲区
+            self.data_buffers[subject_id].append(eeg_data)
+            
+            # 计算当前缓冲区数据长度（秒）
+            total_samples = sum(data.shape[1] for data in self.data_buffers[subject_id])
+            buffer_duration = total_samples / sampling_rate
+            
+            logger.info(f"受试者 {subject_id} 的数据缓冲区: {len(self.data_buffers[subject_id])}个数据包, {buffer_duration:.2f}秒")
+            
+            # 优化的数据处理策略：
+            # 1. 如果单个数据包长度已经足够，直接处理
+            # 2. 如果缓冲区累积数据长度达到要求，则处理
+            # 3. 保持更灵活的重叠策略
+            
+            # 检查单个数据包是否足够长
+            current_duration = eeg_data.shape[1] / sampling_rate
+            process_now = False
+            
+            if current_duration >= self.min_data_duration:
+                # 单个数据包足够长，可以直接处理
+                logger.info(f"当前数据包长度({current_duration:.2f}秒)已满足最小要求，直接处理")
+                process_now = True
+                # 使用当前数据包
+                process_data = eeg_data
+                process_metadata = metadata.copy()
+                process_metadata.update({
+                    'subject_id': subject_id,
+                    'n_samples': process_data.shape[1],
+                    'duration': current_duration
+                })
+            elif buffer_duration >= self.min_data_duration:
+                # 缓冲区累积数据长度达到要求
+                logger.info(f"缓冲区累积数据长度({buffer_duration:.2f}秒)已满足最小要求，处理合并数据")
+                process_now = True
+                # 合并缓冲区数据
+                process_data = np.concatenate(self.data_buffers[subject_id], axis=1)
+                process_metadata = self.metadata_buffers[subject_id].copy()
+                process_metadata.update({
+                    'subject_id': subject_id,
+                    'n_samples': process_data.shape[1],
+                    'duration': buffer_duration
+                })
+            
+            if process_now:
+                # 处理数据
+                logger.info(f"处理数据，形状: {process_data.shape}")
+                
+                # 创建EEGRDD对象
+                logger.info(f"开始创建EEGRDD对象，metadata keys: {list(process_metadata.keys())}")
+                eeg_rdd = EEGRDD.from_metadata_and_data(process_metadata, process_data)
+                
+                # 创建后检查
+                logger.info(f"创建EEGRDD后，channel_locations长度: {len(eeg_rdd.channel_locations) if hasattr(eeg_rdd, 'channel_locations') else 0}")
+                self.latest_eegrdd = eeg_rdd
+                
+                # 触发回调
+                if self.data_callback and callable(self.data_callback):
+                    logger.info(f"触发数据回调: 受试者 {subject_id}, 数据长度: {process_metadata['duration']:.2f}秒")
+                    try:
+                        self.data_callback(subject_id, eeg_rdd)
+                    except Exception as e:
+                        logger.error(f"数据回调执行失败: {e}", exc_info=True)
+                
+                # 更新缓冲区 - 优化的重叠策略
+                overlap_duration = min(self.buffer_duration * 0.2, 0.5)  # 动态重叠时间，最大0.5秒
+                overlap_samples = int(sampling_rate * overlap_duration)
+                
+                if process_data.shape[1] > overlap_samples:
+                    # 保留最新的数据作为重叠
+                    self.data_buffers[subject_id] = [process_data[:, -overlap_samples:]]
+                    logger.info(f"保留{overlap_samples}个样本点({overlap_duration:.2f}秒)作为重叠")
+                else:
+                    # 如果数据太短，清空缓冲区重新开始
+                    self.data_buffers[subject_id] = []
+                    logger.info(f"数据太短，清空受试者 {subject_id} 的数据缓冲区")
+                
+                # 更新元数据缓冲区
+                self.metadata_buffers[subject_id] = metadata.copy()
+            
+            # 缓冲区管理 - 防止缓冲区过大
+            if buffer_duration > self.buffer_duration * 1.5:
+                # 如果缓冲区过大，只保留最新的数据
+                keep_duration = self.buffer_duration
+                keep_samples = int(keep_duration * sampling_rate)
+                
+                # 计算需要保留的数据包
+                new_buffer = []
+                current_samples = 0
+                
+                # 从后向前遍历数据包，直到达到所需的样本数
+                for data in reversed(self.data_buffers[subject_id]):
+                    if current_samples >= keep_samples:
+                        break
+                    new_buffer.insert(0, data)
+                    current_samples += data.shape[1]
+                
+                # 更新缓冲区
+                self.data_buffers[subject_id] = new_buffer
+                logger.info(f"缓冲区过大，已清理至{current_samples}个样本点({current_samples/sampling_rate:.2f}秒)")
         except Exception as e:
-            logger.error(f"处理数据时出错: {e}", exc_info=True)
-    
-    def get_latest_data(self):
-        """获取最新接收到的EEGRDD对象"""
-        return self.latest_eegrdd
-    
-    def stop(self):
-        """停止接收数据"""
-        self.is_running = False
-        
-        # 关闭所有连接
-        for subject_id, conn in self.metadata_connections.items():
-            try:
-                conn.close()
-            except:
-                pass
-                
-        for subject_id, conn in self.data_connections.items():
-            try:
-                conn.close()
-            except:
-                pass
-                
-        # 等待所有线程结束
-        for thread in self.receiver_threads:
-            if thread.is_alive():
-                thread.join(timeout=2.0)
-                
-        logger.info("数据接收已停止")
+            logger.error(f"处理接收数据时出错: {e}", exc_info=True)
 

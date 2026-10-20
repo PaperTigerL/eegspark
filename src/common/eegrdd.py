@@ -1,7 +1,7 @@
 import numpy as np
 import json
 from dataclasses import dataclass, field
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Union
 
 @dataclass
 class EEGRDD:
@@ -33,6 +33,11 @@ class EEGRDD:
     data_range: List[float] = None  # 数据范围
     annotations: List[Dict] = field(default_factory=list)  # 注释
     json_metadata: Dict = field(default_factory=dict)  # 原始JSON元数据
+    
+    # 源定位分析所需字段
+    bads: List[str] = field(default_factory=list)  # 坏通道列表
+    projs: List[Dict[str, Any]] = field(default_factory=list)  # 投影操作列表
+    nfree: int = 1  # 自由度参数
 
     def __post_init__(self):
         # 确保数据范围存在
