@@ -1,0 +1,16 @@
+<ivysettings>
+    <settings defaultResolver="default"/>
+    <caches defaultCacheDir="/app/src/ivy_cache"/>
+    <resolvers>
+        <chain name="default">
+            <filesystem name="local">
+                <ivy pattern="/app/src/ivy_cache/local/[organisation]/[module]/[revision]/[type]s/[artifact].[ext]"/>
+                <artifact pattern="/app/src/ivy_cache/local/[organisation]/[module]/[revision]/[type]s/[artifact].[ext]"/>
+            </filesystem>
+            <ibiblio name="public" m2compatible="true"/>
+        </chain>
+    </resolvers>
+    <modules>
+        <module organisation=".*" name=".*" resolver="default"/>
+    </modules>
+</ivysettings>

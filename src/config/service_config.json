@@ -1,0 +1,30 @@
+{
+    "service_discovery": {
+        "enabled": true,
+        "registry_host": "localhost",
+        "registry_port": 8500
+    },
+    
+    "data_source": {
+        "host": "0.0.0.0",
+        "metadata_port": 9000,
+        "data_port": 9001,
+        "dataset_root": "/app/data/ds005779",
+        "service_id": "eeg_data_source"
+    },
+    
+    "receiver": {
+        "host": "0.0.0.0",
+        "metadata_port": 9000,
+        "data_port": 9001,
+        "save_dir": "./received_data",
+        "buffer_duration": 3.0,
+        "min_data_duration": 2.0
+    },
+    
+    "java_gateway": {
+        "host": "0.0.0.0",
+        "port": 25333,
+        "callback_port": 25334
+    }
+}

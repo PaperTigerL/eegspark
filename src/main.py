@@ -1,250 +1,207 @@
+#!/usr/bin/env python
+import eventlet
+eventlet.monkey_patch()
 import os
-os.environ['MPLCONFIGDIR'] = '/tmp/matplotlib'
+os.environ["MPLCONFIGDIR"] = "/tmp/matplotlib"
 import sys
 import time
 import argparse
 import logging
 import signal
 import traceback
-import py4j.protocol
 import atexit
 import threading
+import numpy as np
+import datetime
+import socket
+import subprocess
+import gc
 
-# 导入Spark相关模块
+# 获取当前文件的绝对路径
+current_file_path = os.path.abspath(__file__)
+# 获取 tests 目录路径
+tests_dir = os.path.dirname(current_file_path)
+# 获取 src 目录路径（因为 tests 在 src 下）
+src_dir = os.path.dirname(tests_dir)
+
+# 将 src 目录加入 Python 路径中
+if src_dir not in sys.path:
+    sys.path.append(src_dir)
 from pyspark.sql import SparkSession
 from pyspark import SparkContext, SparkConf
+from src.processor.pipeline import EEGProcessingPipeline
 
-# 导入接收器和处理器模块
-from receiver.receiver import SparkEEGReceiver
-from processor.pipeline import EEGProcessingPipeline
-from processor.realtime_eeg_processor import RealtimeEEGProcessor, RealtimeProcessingConfig
+from src.receiver.receiver import EEGReceiver
 
-# 配置日志
-logging.basicConfig(level=logging.INFO,
-                    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-logger = logging.getLogger('EEGMain')
-
-
-def setup_spark_session(app_name="EEGSparkProcessor"):
-    """创建SparkSession实例
-    
-    使用与test_sparkcontext.py相同的方法创建SparkContext，连接到Spark集群
-    
-    Args:
-        app_name: Spark应用名称
-        
-    Returns:
-        SparkSession实例
-    """
-    from pyspark.sql import SparkSession
-    from pyspark import SparkContext, SparkConf
-    import os
-    import socket
-    
-    # 首先测试网络连接
-    try:
-        # 测试与Spark Master的网络连接
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(5)  # 设置超时时间为5秒
-        result = sock.connect_ex(('spark-master', 7077))
-        sock.close()
-        
-        if result != 0:
-            logger.error(f"无法连接到Spark Master, 错误代码: {result}")
-            raise ConnectionError(f"无法连接到Spark Master, 错误代码: {result}")
-        else:
-            logger.info("成功连接到Spark Master")
-    except Exception as net_err:
-        logger.error(f"网络连接测试失败: {net_err}")
-        raise
-    
-    # 创建SparkContext
-    try:
-        sc = SparkContext(master="spark://spark-master:7077", appName=app_name)
-        logger.info(f"SparkContext创建成功: appName={sc.appName}")
-        
-        # 基于SparkContext创建SparkSession
-        spark = SparkSession(sc)
-        logger.info(f"SparkSession创建成功")
-        return spark
-    except py4j.protocol.Py4JError as py4j_err:
-        logger.error(f"Py4J连接错误: {py4j_err}")
-        raise
-    except Exception as e:
-        logger.error(f"SparkContext创建失败: {e}")
-        raise
-
-
-
-
-def stop_spark_session():
-    """停止SparkContext，确保资源被释放"""
-    try:
-        from pyspark import SparkContext
-        # 检查是否有活跃的SparkContext
-        if SparkContext._active_spark_context:
-            logger.info("正在停止SparkContext...")
-            try:
-                SparkContext._active_spark_context.stop()
-                logger.info("SparkContext已停止")
-            except Exception as stop_err:
-                logger.error(f"停止SparkContext失败: {stop_err}")
-                # 尝试使用更强制的方式关闭
-                if hasattr(SparkContext._active_spark_context, '_jsc'):
-                    try:
-                        SparkContext._active_spark_context._jsc.sc().stop()
-                    except Exception:
-                        pass
-            
-            # 将活跃的SparkContext设为None
-            SparkContext._active_spark_context = None
-        else:
-            logger.info("没有活跃的SparkContext")
-    except Exception as e:
-        logger.error(f"停止SparkContext失败: {e}")
-
+logger = logging.getLogger(__name__)
 
 def signal_handler(sig, frame):
     """信号处理函数，用于捕获各种终止信号"""
-    signal_name = signal.Signals(sig).name if hasattr(signal, 'Signals') else f"信号 {sig}"
+    signal_name = (
+        signal.Signals(sig).name if hasattr(signal, "Signals") else f"信号 {sig}"
+    )
     logger.info(f"接收到{signal_name}信号，准备关闭系统...")
-    stop_spark_session()
-    sys.exit(0)
-
-
-# 注册退出处理函数，确保程序退出时资源被释放
-def exit_handler():
-    """程序退出时的清理函数"""
-    logger.info("程序正常退出，执行清理操作...")
-    stop_spark_session()
-
-# 注册退出处理函数
-atexit.register(exit_handler)
-
-def process_eeg_data(subject_id, eegrdd):
-    """处理EEG数据的回调函数
     
-    Args:
-        subject_id: 受试者ID
-        eegrdd: EEGRDD对象
-    """
     try:
-        logger.info(f"接收到受试者 {subject_id} 的EEG数据，准备处理")
-        # 全局处理流水线会处理数据
-        global pipeline
-        if pipeline:
-            processed_eegrdd = pipeline.process(subject_id, eegrdd)
-            logger.info(f"受试者 {subject_id} 的EEG数据处理完成")
+        # 先停止接收器
+        if 'receiver' in globals():
+            receiver.stop_receiving()
             
-            # 保存处理后的数据
-            output_dir = os.path.join(os.path.dirname(__file__), 'receiver', 'data', 'output')
-            pipeline.save_processed_data(processed_eegrdd, output_dir)
+        # 再停止Spark会话
+        stop_spark_session()
     except Exception as e:
-        logger.error(f"处理受试者 {subject_id} 的EEG数据时出错: {e}")
+        logger.error(f"关闭资源时出错: {str(e)}")
+    finally:
+        sys.exit(0)
 
+def setup_spark_session(app_name="EEGSparkApp", master_url="local[*]"):
+    """创建并配置Spark会话"""
+    try:
+        conf = SparkConf()
+        conf.setAppName(app_name)
+        conf.setMaster(master_url)
+        conf.set("spark.driver.memory", "4g")
+        conf.set("spark.executor.memory", "4g")
+        conf.set("spark.sql.execution.arrow.pyspark.enabled", "true")
+        conf.set("spark.jars.ivySettings", "/app/src/config/ivy_settings.conf")
+        os.environ["JAVA_HOME"] = "/usr/lib/jvm/java-17-openjdk-amd64"
+        spark = SparkSession.builder.config(conf=conf).getOrCreate()
+        sc = spark.sparkContext
+        return spark, sc
+    except Exception as e:
+        return None, None
+
+def stop_spark_session():
+    """停止Spark会话并清理资源"""
+    def _stop_spark():
+        try:
+            spark = SparkSession.getActiveSession()
+            if spark:     
+                spark.stop()
+        except Exception as e:
+            logger.error(f"停止Spark会话时出错: {str(e)}", exc_info=True)
+    
+    # 在单独的线程中停止Spark会话以避免阻塞主循环
+    threading.Thread(target=_stop_spark, daemon=True).start()
 
 def main():
     """主函数"""
+    global pipeline, receiver
+    
+    # 设置信号处理
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
     # 解析命令行参数
-    parser = argparse.ArgumentParser(description='Spark EEG测试程序')
-    parser.add_argument('--app-name', type=str, default="EEGSparkTest", help='Spark应用名称')
-    parser.add_argument('--host', default='0.0.0.0', help='接收器监听地址')
-    parser.add_argument('--metadata-port', type=int, default=9000, help='元数据端口')
-    parser.add_argument('--data-port', type=int, default=9001, help='数据端口')
-    parser.add_argument('--save-dir', default='./received_data', help='数据保存目录')
+    parser = argparse.ArgumentParser(description="Spark EEG测试程序")
+    parser.add_argument("--app-name", default="EEGSparkApp", help="Spark应用名称")
+    parser.add_argument("--master", default="local[*]", help="Spark master URL")
+    parser.add_argument("--log-dir", default="/app/logs", help="日志目录路径")
+    parser.add_argument("--config", default="config/config.yaml", help="配置文件路径")
     args = parser.parse_args()
     
-    # 注册信号处理器，处理更多类型的信号
-    signal.signal(signal.SIGINT, signal_handler)   # Ctrl+C
-    signal.signal(signal.SIGTERM, signal_handler)  # kill命令
-    # 在Windows上，SIGHUP可能不可用
-    if hasattr(signal, 'SIGHUP'):
-        signal.signal(signal.SIGHUP, signal_handler)  # 终端关闭
+    # 基础日志配置
+    logging.basicConfig(
+        level=logging.ERROR,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        handlers=[
+            logging.StreamHandler(),
+            logging.FileHandler(os.path.join("/app/src/logs", "eegspark.log"))
+        ]
+    )
+    logger.info(f"========== EEGSpark 应用启动 ==========")
+    logger.info(f"命令行参数: {sys.argv}")
+    logger.info(f"Python版本: {sys.version}")
+    logger.info(f"工作目录: {os.getcwd()}")
     
-    # 创建SparkSession
+    
     try:
-        spark = setup_spark_session(args.app_name)
-        logger.info(f"SparkSession创建成功: {spark.sparkContext.appName}")
+        # 创建Spark会话
+        spark, sc = setup_spark_session(args.app_name, args.master)
+        if spark is None or sc is None:
+            return 1
         
-        # 创建EEG处理流水线
-        global pipeline
-        processing_config = RealtimeProcessingConfig()
-        pipeline = EEGProcessingPipeline(spark, processing_config)
-        logger.info("EEG处理流水线创建成功")
+        # 创建处理流水线
+        pipeline = EEGProcessingPipeline(spark)
+        
+        # 初始化处理器模块
+        from src.processor import EEGProcessor, ProcessingConfig
+        from src.common.eegrdd import EEGRDD
+        
+        # 导入可视化模块
+        from src.visualization.visualizer import EEGVisualizer
+        from src.visualization.run_visualization_server import main as start_visualization_server
         
         # 创建EEG接收器
-        # 配置数据源 - 格式: (subject_id, meta_host, meta_port, data_host, data_port)
-        data_sources = [
-            ('01', 'data-sender-1', 9000, 'data-sender-1', 9001),
-            ('02', 'data-sender-2', 9002, 'data-sender-2', 9003)
-        ]
-        receiver = SparkEEGReceiver(spark, data_sources, save_dir=args.save_dir)
+        receiver = EEGReceiver()
+        receiver.sc = sc
         
-        # 设置数据处理回调
-        receiver.set_data_callback(process_eeg_data)
-        logger.info("EEG接收器创建成功并设置了数据处理回调")
+        # 创建可视化器
+        visualizer = EEGVisualizer(sampling_rate=5000.0, reference="FCz")
         
-        # 启动接收器
-        receiver.start_receiving()
-        logger.info("EEG接收器已启动，等待数据...")
+        # 启动可视化服务器
+        threading.Thread(target=start_visualization_server, daemon=True).start()
         
-        # 保持主线程运行，并定期检查SparkContext状态
-        logger.info("系统启动成功，按Ctrl+C停止...")
-        try:
-            check_interval = 30  # 每30秒检查一次
-            last_check_time = time.time()
-            
-            while True:
-                current_time = time.time()
-                
-                # 定期检查SparkContext状态
-                if current_time - last_check_time >= check_interval:
-                    if SparkContext._active_spark_context is None:
-                        logger.warning("检测到SparkContext已失效，尝试重新初始化")
-                        try:
-                            spark = setup_spark_session(args.app_name)
-                            logger.info("SparkContext重新初始化成功")
-                            
-                            # 重新创建处理流水线和接收器
-                            pipeline = EEGProcessingPipeline(spark, processing_config)
-                            receiver = SparkEEGReceiver(spark, data_sources, save_dir=args.save_dir)
-                            receiver.set_data_callback(process_eeg_data)
-                            receiver.start_receiving()
-                            logger.info("系统组件已重新初始化")
-                        except Exception as reinit_err:
-                            logger.error(f"SparkContext重新初始化失败: {reinit_err}")
-                    else:
-                        # 验证SparkContext是否仍然有效
-                        try:
-                            is_active = not SparkContext._active_spark_context._jsc.sc().isStopped()
-                            if not is_active:
-                                logger.warning("SparkContext已停止但引用仍存在，清理资源")
-                                SparkContext._active_spark_context = None
-                        except Exception:
-                            pass
-                    
-                    # 输出接收器统计信息
+        # 设置数据回调处理
+        def data_callback(eegrdd_rdd):
+            """处理接收到的EEG数据"""
+            try:
+                # 将数据处理放入线程池异步执行
+                def process_data_async(eegrdd_rdd):
                     try:
-                        stats = receiver.get_stats()
-                        logger.info(f"接收器统计: 已接收 {stats['packets_received']} 个数据包, {stats['bytes_received']/1024/1024:.2f} MB")
-                    except Exception:
-                        pass
-                    
-                    last_check_time = current_time
+                        processed_data = pipeline.process_batch(eegrdd_rdd)
+                        if processed_data:
+                            collected_data = processed_data.collect()
+                            if collected_data:
+                                # 确保数据格式正确
+                                if hasattr(collected_data[0], 'data') and hasattr(collected_data[0], 'channel_names') and hasattr(collected_data[0], 'sampling_rate'):
+                                    visualizer.add_data_source(
+                                        source_id="eeg_data",
+                                        data=collected_data[0].data,
+                                        channel_names=collected_data[0].channel_names,
+                                        sampling_rate=collected_data[0].sampling_rate
+                                    )
+                                    # 触发WebSocket数据更新
+                                    visualizer.update_visualization("eeg_data")
+                    except Exception as e:
+                        logger.error(f"异步处理EEG数据时出错: {str(e)}", exc_info=True)
                 
-                time.sleep(1)
-        except KeyboardInterrupt:
-            logger.info("接收到键盘中断，准备关闭系统")
-            stop_spark_session()
-    except Exception as e:
-        logger.error(f"系统启动失败: {e}")
-        return 1
+                # 启动异步处理线程
+                threading.Thread(target=process_data_async, args=(eegrdd_rdd,), daemon=True).start()
+                
+            except Exception as e:
+                logger.error(f"提交数据处理任务时出错: {str(e)}")
+        
+        # 设置数据处理回调函数
+        receiver.set_data_callback(data_callback)
+        
+        # 启动接收器服务
+        receiver.start_receiving()
+        
+        # 添加默认数据源 - 关键修复！
+        receiver.add_data_source({})
+        logger.info("EEG接收器服务已启动并添加了默认数据源")
+        
+        # 主循环
+        while True:
+            time.sleep(10)
+            gc.collect()
+            # 主循环运行中（已移除冗余日志）
     
-    return 0
+    except Exception as e:  # 捕获所有异常
+        error_msg = f"初始化失败: {str(e)}"
+        logger.error(error_msg, exc_info=True)
+        logger.error(f"系统错误: {error_msg}", exc_info=True)
+        return 1
 
-
-# 全局变量
-pipeline = None
+import sys
+def excepthook(type, value, traceback):
+    if hasattr(value, '__traceback__'):
+        tb = value.__traceback__
+        while tb.tb_next:
+            tb = tb.tb_next
+        print(f"错误发生在文件{tb.tb_frame.f_code.co_filename}第{tb.tb_lineno}行")
+sys.excepthook = excepthook
 
 if __name__ == "__main__":
     sys.exit(main())

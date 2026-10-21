@@ -1,25 +1,37 @@
 // WebSocket客户端实现 - 用于EEG实时可视化系统
 
+// 引入socket.io-client
+import io from 'socket.io-client';
+
 let socket = null;
 let isConnected = false;
 let reconnectAttempts = 0;
 let maxReconnectAttempts = 5;
 let reconnectInterval = 2000; // 重连间隔(毫秒)
 
-// 初始化WebSocket连接
+// 初始化Socket.IO连接
 function initWebSocket() {
-    // 确定WebSocket URL (使用相对路径，自动适应不同部署环境)
-    const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsUrl = `${wsProtocol}//${window.location.host}/ws`;
+    // 确定连接URL (使用相对路径，自动适应不同部署环境)
+    const wsUrl = window.location.host;
     
-    console.log(`正在连接WebSocket: ${wsUrl}`);
+    console.log('Socket.IO连接诊断信息:', {
+        '连接URL': wsUrl,
+        '当前页面URL': window.location.href,
+        '连接时间': new Date().toISOString(),
+        '浏览器信息': navigator.userAgent
+    });
     
-    // 创建WebSocket连接
-    socket = new WebSocket(wsUrl);
+    // 创建Socket.IO连接
+    socket = io('ws://' + wsUrl, {
+        reconnection: true,
+        reconnectionAttempts: maxReconnectAttempts,
+        reconnectionDelay: reconnectInterval,
+        transports: ['websocket']
+    });
     
-    // 连接打开事件
-    socket.onopen = function() {
-        console.log('WebSocket连接已建立');
+    // 连接成功事件
+    socket.on('connect', function() {
+        console.log('Socket.IO连接已建立');
         isConnected = true;
         reconnectAttempts = 0;
         showConnectionStatus('已连接', 'success');
@@ -28,13 +40,11 @@ function initWebSocket() {
         if (activeSource) {
             subscribeToDataSource(activeSource);
         }
-    };
+    });
     
     // 接收消息事件
-    socket.onmessage = function(event) {
+    socket.on('message', function(message) {
         try {
-            const message = JSON.parse(event.data);
-            
             // 处理不同类型的消息
             switch (message.type) {
                 case 'data_update':
@@ -53,48 +63,52 @@ function initWebSocket() {
                     console.log('收到未知类型的消息:', message);
             }
         } catch (error) {
-            console.error('处理WebSocket消息时出错:', error);
+            console.error('处理Socket.IO消息时出错:', error);
         }
-    };
+    });
     
-    // 连接关闭事件
-    socket.onclose = function() {
-        console.log('WebSocket连接已关闭');
+    // 错误处理
+    socket.on('connect_error', function(error) {
+        console.error('Socket.IO连接错误:', error);
         isConnected = false;
-        showConnectionStatus('已断开', 'error');
+        showConnectionStatus('连接错误', 'error');
         
-        // 尝试重新连接
+        // 自动重连
         if (reconnectAttempts < maxReconnectAttempts) {
             reconnectAttempts++;
-            showConnectionStatus(`已断开，${reconnectInterval/1000}秒后重连(${reconnectAttempts}/${maxReconnectAttempts})`, 'warning');
-            
-            setTimeout(function() {
-                initWebSocket();
-            }, reconnectInterval);
+            showConnectionStatus(`正在重连(${reconnectAttempts}/${maxReconnectAttempts})`, 'warning');
         } else {
-            showConnectionStatus('连接失败，请刷新页面重试', 'error');
+            showConnectionStatus('连接失败', 'error');
         }
-    };
+    });
     
-    // 连接错误事件
-    socket.onerror = function(error) {
-        console.error('WebSocket连接错误:', error);
-        showConnectionStatus('连接错误', 'error');
-    };
+    // 连接关闭事件
+    socket.on('disconnect', function(reason) {
+        console.log('Socket.IO连接已关闭，原因:', reason);
+        isConnected = false;
+        
+        // 非主动关闭时尝试重连
+        if (reason !== 'io client disconnect' && reconnectAttempts < maxReconnectAttempts) {
+            reconnectAttempts++;
+            showConnectionStatus(`正在重连(${reconnectAttempts}/${maxReconnectAttempts})`, 'warning');
+        } else {
+            showConnectionStatus('连接已断开', 'info');
+        }
+    });
 }
 
 // 订阅数据源更新
 function subscribeToDataSource(sourceId) {
     if (!isConnected || !socket) {
-        console.warn('WebSocket未连接，无法订阅数据源');
+        console.warn('Socket.IO未连接，无法订阅数据源');
         return false;
     }
     
     try {
-        socket.send(JSON.stringify({
+        socket.emit('message', {
             action: 'subscribe',
             source_id: sourceId
-        }));
+        });
         console.log(`已订阅数据源: ${sourceId}`);
         return true;
     } catch (error) {
@@ -110,29 +124,37 @@ function unsubscribeFromDataSource(sourceId) {
     }
     
     try {
-        socket.send(JSON.stringify({
+        socket.emit('message', {
             action: 'unsubscribe',
             source_id: sourceId
-        }));
+        });
         console.log(`已取消订阅数据源: ${sourceId}`);
         return true;
     } catch (error) {
         console.error('取消订阅数据源时出错:', error);
         return false;
     }
-}
+
 
 // 处理数据更新
 function handleDataUpdate(data) {
+    console.log('收到数据更新:', data);
+    
     // 检查是否是当前活动数据源的更新
     if (data.source_id === activeSource) {
         // 自动更新可视化
-        if (document.getElementById('auto-refresh').checked) {
+        if (document.getElementById('auto-refresh')) {
+            if (document.getElementById('auto-refresh').checked) {
+                refreshVisualization(data.visualization_data);
+            }
+        } else {
             refreshVisualization(data.visualization_data);
         }
         
         // 更新数据源信息
         updateDataSourceInfo(data);
+    } else {
+        console.log('收到非活动数据源的更新:', data.source_id);
     }
 }
 
@@ -221,3 +243,4 @@ window.addEventListener('beforeunload', function() {
         socket.close();
     }
 });
+}

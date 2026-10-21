@@ -5,6 +5,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>EEG Real-time Visualization System</title>
+    <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
     <style>
         body {
             font-family: Arial, sans-serif;
@@ -280,7 +281,13 @@
         </div>
         <div id="app"></div>
     </div>
-    <script src="/static/app.js"></script>
-    <script src="/static/websocket_client.js"></script>
+    <script src="{{ url_for('static', filename='app.js') }}"></script>
+     <script src="{{ url_for('static', filename='websocket_client.js') }}"></script>
+     <script>
+         document.addEventListener('DOMContentLoaded', function() {
+             // 确保其他初始化完成后才建立WebSocket连接
+             setTimeout(initWebSocket, 500);
+         });
+     </script>
 </body>
 </html>
